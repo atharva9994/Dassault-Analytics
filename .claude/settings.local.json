@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/Atharva/dassault-analytics/app.py:*)",
+      "Bash(/c/Users/Atharva/dassault-analytics/.streamlit/secrets.toml:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(python /c/Users/Atharva/dassault-analytics/chat_sidebar.py)",
+      "Bash(git -C c:UsersAtharvadassault-analytics log --oneline -10)",
+      "Read(//mnt/c/Users/Atharva/**)",
+      "Bash(cmd.exe /c \"dir C:\\\\Users\\\\Atharva\\\\dassault-analytics\")",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
