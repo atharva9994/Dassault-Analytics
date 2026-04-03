@@ -49,9 +49,9 @@ if uploaded_file is not None:
         st.dataframe(df.head(20), use_container_width=True)
 
 elif use_sample:
-    sample_path = os.path.join(os.path.dirname(__file__), "data", "dassault_license_sales_data.csv")
+    sample_path = os.path.join(os.path.dirname(__file__), "data", "dassault_license_sales_data.xlsx")
     if not os.path.exists(sample_path):
-        st.error("Sample dataset not found at data/dassault_license_sales_data.csv.")
+        st.error("Sample dataset not found at data/dassault_license_sales_data.xlsx.")
     else:
         with st.spinner("Loading sample dataset…"):
             # Wrap the file path in a file-like object so clean_uploaded_file can process it
