@@ -3,7 +3,7 @@
 A business intelligence and analytics application for Dassault Systèmes license sales data — combining interactive dashboards, machine learning, and LLM-powered data exploration.
 
 ## Live App
-[Streamlit App URL]
+https://2rtruegbzac9wsf9zwyuay.streamlit.app/
 
 ## What's Inside
 
