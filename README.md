@@ -1,57 +1,27 @@
-# Dassault Analytics
+# 3DS License Sales Analytics
 
-A Streamlit analytics app for Dassault Systèmes license sales data — built to explore revenue, churn risk, customer segments, and ask plain-English questions about the data.
+A business intelligence and analytics application for Dassault Systèmes license sales data — combining interactive dashboards, machine learning, and LLM-powered data exploration.
 
-## Pages
+## Live App
+[Streamlit App URL]
 
-| Page | Description |
-|---|---|
-| **Home** | Upload a CSV/Excel file or load the built-in sample dataset |
-| **Dashboard** | Revenue trends, deal performance, regional breakdown, and KPIs |
-| **Churn** | Random Forest churn prediction with feature importance and high-risk customer list |
-| **Segments** | KMeans customer segmentation by revenue, deal activity, and usage |
-| **Ask Data** | Chat interface — ask business questions in plain English, get computed results |
+## What's Inside
 
-## Getting Started
+- **Upload & Clean** — Automated data cleaning pipeline that handles multi-sheet Excel files, removes duplicates, standardizes columns, and fixes missing values
+- **Sales Dashboard** — Interactive Plotly charts with KPIs tracking revenue by product (SOLIDWORKS, CATIA, SIMULIA, ENOVIA, DELMIA, 3DEXPERIENCE Platform), region, industry, and license type with real-time filters
+- **Churn Prediction** — Random Forest ML model identifying high-risk accounts and quantifying revenue at risk
+- **Customer Segmentation** — K-means clustering grouping customers into actionable segments based on revenue, usage, and deal patterns
+- **Ask Your Data** — LLM-powered sidebar chat using Claude API for natural language queries on business data
 
-### Run locally
+## Dataset
 
-```bash
-pip install -r requirements.txt
-streamlit run App.py
-```
-
-### Use the sample dataset
-
-On the Home page, check **"Use sample dataset"** to load the included dataset instantly without uploading a file.
-
-### Bring your own data
-
-Upload a CSV or Excel file with columns such as:
-
-`Customer_Name`, `Deal_Value_USD`, `Deal_Stage`, `Product`, `Region`, `Customer_Segment`, `License_Type`, `Seats`, `Usage_Hours_Per_Month`, `Churn_Risk`, `Booking_Date`
-
-The app auto-cleans the file on upload (deduplication, type coercion, blank filling).
-
-## Ask Data
-
-The Ask Data page uses the **Claude API** (Anthropic). To enable it:
-
-- Add your API key to `.streamlit/secrets.toml`:
-  ```toml
-  ANTHROPIC_API_KEY = "sk-ant-..."
-  ```
-- Or paste it directly in the app when prompted.
-
-Example questions:
-- *Who are the top 5 customers by revenue?*
-- *Which segment has the highest deal value?*
-- *Show churn risk by region*
+Synthetic dataset modeled on Dassault Systèmes' product portfolio with 2,000 license transactions across 6 products, 4 regions, 9 industries, and 4 license types (Subscription, Perpetual, Floating, Node-Locked). Use the "Use sample dataset" checkbox to load it automatically.
 
 ## Tech Stack
+Python, Pandas, Plotly, Streamlit, scikit-learn, Anthropic Claude API
 
-- [Streamlit](https://streamlit.io)
-- [Plotly](https://plotly.com/python/)
-- [scikit-learn](https://scikit-learn.org) — Random Forest, KMeans
-- [Anthropic Claude API](https://www.anthropic.com)
-- [Pandas](https://pandas.pydata.org)
+## How to Run Locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
