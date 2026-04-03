@@ -18,10 +18,10 @@ Sample rows:
    - Exactly 3 bullet points starting with a dash -, each a specific finding or number
    - Format all currency as $1,234,567 inside the explanation
 
-2. ONLY add {sep} and Python code if the question asks for a ranked list, top-N, count,
-   or sum best shown as a table or single number.
-   - If the question is strategic, conceptual, or advisory (e.g. "give ideas", "what should
-     we do", "explain") -> write ONLY the <explanation> block, NO {sep}, NO code.
+2. For ANY question that involves data — rankings, totals, counts, customers, segments,
+   revenue, churn, products, regions, performance — you MUST append {sep} followed by
+   Python code. Only skip code for purely conceptual/advisory questions with no data
+   component (e.g. "give ideas", "explain a concept").
    - If you do write code: produce exactly ONE result stored in `result`:
        * A clean pandas DataFrame with at most 10 rows and at most 5 columns, OR
        * A single scalar (int or float)
