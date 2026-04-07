@@ -182,9 +182,24 @@ def _render_final(final_event: dict, step_results: dict) -> None:
     # Metrics row
     metrics = final_event.get("metrics", [])
     if metrics:
-        metric_cols = st.columns(len(metrics))
-        for col, m in zip(metric_cols, metrics):
-            col.metric(m.get("label", ""), m.get("value", ""))
+        # Split into rows of 2 so cards have enough width for long text
+        for row_start in range(0, len(metrics), 2):
+            row = metrics[row_start : row_start + 2]
+            cols = st.columns(2)
+            for col, m in zip(cols, row):
+                label = m.get("label", "")
+                value = m.get("value", "")
+                # Use st.metric only for pure numbers / short values (≤18 chars)
+                if len(value) <= 18 and not any(c.isalpha() and c not in "$%KMB" for c in value):
+                    col.metric(label, value)
+                else:
+                    col.markdown(
+                        f"""<div style="background:#f0f2f6;padding:12px 16px;border-radius:8px;margin-bottom:8px;">
+<p style="margin:0;font-size:13px;color:#666;">{label}</p>
+<p style="margin:0;font-size:16px;font-weight:500;word-break:break-word;">{value}</p>
+</div>""",
+                        unsafe_allow_html=True,
+                    )
         st.markdown("")
 
     # Warnings
