@@ -44,6 +44,8 @@ Columns available: {cols}
 Sample rows:
 {sample}
 
+IMPORTANT: Your ENTIRE response must be exactly ONE valid JSON object. No text before it, no text after it, no multiple JSON objects, no markdown fences. One JSON object only.
+
 Reason through the question step by step. For EVERY step respond with ONLY a valid JSON object — no markdown, no text outside the JSON.
 
 Intermediate step format:
@@ -88,15 +90,44 @@ Rules:
 
 
 # ── JSON parser ───────────────────────────────────────────────────────────────
+def _extract_first_json(text: str) -> str:
+    """Return the substring of text that is exactly the first complete {...} object."""
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No '{' found in response")
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise ValueError("Unmatched braces — no complete JSON object found")
+
+
 def _parse_json(raw: str) -> dict:
     text = raw.strip()
+    # Unwrap ```json ... ``` fences if present
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fenced:
         text = fenced.group(1).strip()
-    obj_match = re.search(r"\{[\s\S]*\}", text)
-    if obj_match:
-        return json.loads(obj_match.group())
-    raise ValueError(f"No JSON object found in: {raw[:300]}")
+    # Extract the first complete {...} using a bracket counter (handles multiple objects)
+    json_str = _extract_first_json(text)
+    return json.loads(json_str)
 
 
 # ── Chart helper ──────────────────────────────────────────────────────────────
@@ -210,6 +241,8 @@ def run_agent(question: str, df: pd.DataFrame, api_key: str):
     system_prompt = _build_agent_prompt(df)
     messages = [{"role": "user", "content": question}]
 
+    parse_failures = 0
+
     for _ in range(7):
         response = client.messages.create(
             model="claude-sonnet-4-6",
@@ -218,13 +251,49 @@ def run_agent(question: str, df: pd.DataFrame, api_key: str):
             messages=messages,
         )
         raw = response.content[0].text.strip()
-        messages.append({"role": "assistant", "content": raw})
 
+        # ── Parse with up to 3 retries before falling back to plain chat ─────
+        step = None
         try:
             step = _parse_json(raw)
-        except (ValueError, json.JSONDecodeError) as e:
-            yield {"type": "error", "message": f"Parse error: {e}\n\nRaw: {raw[:300]}"}
-            return
+        except (ValueError, json.JSONDecodeError):
+            parse_failures += 1
+            if parse_failures < 3:
+                # Ask Claude to fix its response without adding to conversation history
+                retry_resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=messages + [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": "Your response was not valid JSON. Return ONLY one JSON object, nothing else."},
+                    ],
+                )
+                raw = retry_resp.content[0].text.strip()
+                try:
+                    step = _parse_json(raw)
+                except (ValueError, json.JSONDecodeError):
+                    pass  # will hit fallback below
+
+            if step is None:
+                # Fallback: plain-text answer, displayed as info
+                fallback_resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": question}],
+                )
+                yield {
+                    "type": "final",
+                    "number": 1,
+                    "description": "Analysis",
+                    "metrics": [],
+                    "chart_step": None,
+                    "warnings": [],
+                    "recommendations": [fallback_resp.content[0].text.strip()],
+                }
+                return
+
+        messages.append({"role": "assistant", "content": raw})
 
         step_num = step.get("step_number", len(messages) // 2)
 
