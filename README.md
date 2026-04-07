@@ -12,6 +12,7 @@ https://2rtruegbzac9wsf9zwyuay.streamlit.app/
 - **Churn Prediction** — Random Forest ML model identifying high-risk accounts and quantifying revenue at risk
 - **Customer Segmentation** — K-means clustering grouping customers into actionable segments based on revenue, usage, and deal patterns
 - **Ask Your Data** — LLM-powered sidebar chat using Claude API for natural language queries on business data
+- **AI Agent** — Multi-step reasoning agent that breaks complex questions into steps, runs real Pandas computations, and returns a visual executive report with metric cards, Plotly charts, warnings, and recommendations
 
 ## Dataset
 
