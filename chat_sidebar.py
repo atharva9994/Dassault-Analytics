@@ -149,7 +149,7 @@ def render_chat_sidebar():
     # ── Question input ────────────────────────────────────────────────────────
     question = st.sidebar.text_input(
         "Ask a question",
-        placeholder="e.g. Top 5 customers by revenue",
+        placeholder="e.g. What are the top 5 customers by revenue?",
         key="sidebar_chat_input",
     )
     ask_clicked = st.sidebar.button("Ask", use_container_width=True)
