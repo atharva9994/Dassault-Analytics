@@ -390,6 +390,10 @@ def build_graph(api_key: str, df: pd.DataFrame):
     sample = df.head(3).to_string(index=False)
     step_dfs: dict = {}
 
+    # Shared execution context — persists variables across all analyst steps
+    import numpy as np
+    shared_context: dict = {"df": df.copy(), "pd": pd, "np": np}
+
     # ── Node 1: Planner ───────────────────────────────────────────────────────
     def planner_node(state: AgentState) -> dict:
         try:
@@ -427,11 +431,13 @@ Return ONLY a JSON object for the NEXT pandas query:
 {{"description": "What this query computes", "code": "result = df.groupby('Product')['Deal_Value_USD'].sum().nlargest(10).reset_index()"}}
 
 Critical rules for the code:
-- Store output in variable `result`
-- result = DataFrame (max 10 rows, max 5 columns) OR scalar
-- Group by business columns only — never by Deal_ID
-- Always sort descending and limit to top 10
-- Use exact column names from the dataset"""),
+- The DataFrame is called `df`. Pandas is `pd`. NumPy is `np`.
+- Store the final output in a variable called `result` — do NOT use print().
+- result must be a DataFrame (max 10 rows, max 5 columns) OR a scalar.
+- You MAY create intermediate variables (e.g. filtered_df, benchmark) — they persist across steps.
+- Group by business columns only — never by Deal_ID.
+- Always sort descending and limit to top 10.
+- Use exact column names from the dataset."""),
                 HumanMessage(content=(
                     f"Question: {state['question']}\n\n"
                     f"Plan:\n{state['plan']}\n\n"
@@ -450,17 +456,36 @@ Critical rules for the code:
 
         if code:
             try:
-                local_vars = {"df": df.copy(), "pd": pd}
-                exec(code, {}, local_vars)
-                result = local_vars.get("result")
+                exec(code, shared_context)
+                result = shared_context.get("result")
+            except Exception as first_err:
+                # Ask Claude to rewrite with a simpler approach
+                try:
+                    fix_resp = llm.invoke([
+                        SystemMessage(content=f"""{_ANALYST_BASE}
+The code failed. Rewrite it using only `df` and `pd` with no external variables.
+Return ONLY a JSON object: {{"description": "...", "code": "result = ..."}}"""),
+                        HumanMessage(content=(
+                            f"Failed code:\n{code}\n\n"
+                            f"Error: {first_err}\n\n"
+                            "Rewrite simpler."
+                        )),
+                    ])
+                    fixed = _extract_json(fix_resp.content)
+                    exec(fixed.get("code", ""), shared_context)
+                    result = shared_context.get("result")
+                    description = fixed.get("description", description)
+                except Exception:
+                    result = None
+                    result_str = "Could not compute this step — continuing with available data."
+
+            if result is not None:
                 if isinstance(result, pd.DataFrame):
                     step_dfs[step_num] = result.head(10)
                     result_str = result.head(10).to_string(index=False)
-                elif result is not None:
+                else:
                     step_dfs[step_num] = result
                     result_str = str(result)
-            except Exception as e:
-                result_str = f"Execution error: {e}"
 
         new_results = state["data_results"] + [{
             "step": step_num,
