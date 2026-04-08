@@ -190,13 +190,12 @@ Rules:
     # ── Node 4: Advisor ───────────────────────────────────────────────────────
     def advisor_node(state: AgentState) -> dict:
         full_data = "\n\n".join(
-            f"Step {r['step']}: {r['description']}\n{r['result_str']}"
+            f"Step {r['step']}: {r['description']}\nResult:\n{r['result_str']}"
             for r in state["data_results"]
         )
-        try:
-            resp = llm.invoke([
-                SystemMessage(content=f"""You are a senior business advisor for Dassault Systèmes.
-Return ONLY a JSON object:
+        resp = llm.invoke([
+            SystemMessage(content=f"""You are a senior business advisor for Dassault Systèmes.
+Return ONLY a JSON object with this exact structure:
 {{
   "metrics": [
     {{"label": "Total Revenue at Risk", "value": "$2,450,000"}},
@@ -209,18 +208,25 @@ Return ONLY a JSON object:
 }}
 
 Rules:
-- metrics: 2–4 key numbers extracted from the actual data results
-- recommendations: 2–4 short actionable bullets (1–2 lines each) with real numbers
-- Return ONLY valid JSON"""),
-                HumanMessage(content=f"Question: {state['question']}\n\nData:\n{full_data}"),
-            ])
-            data = _extract_json(resp.content)
-            return {
-                "metrics": data.get("metrics", []),
-                "recommendations": data.get("recommendations", []),
-            }
+- metrics: 2–4 key numbers pulled from the actual data results above
+- recommendations: 2–4 short actionable bullets with specific numbers from the data
+- RETURN ONLY THE JSON OBJECT. No explanation, no markdown, no extra text."""),
+            HumanMessage(content=f"Question: {state['question']}\n\nData collected:\n{full_data}"),
+        ])
+        raw = resp.content.strip()
+        # Try structured parse first
+        try:
+            data = _extract_json(raw)
+            metrics = data.get("metrics", [])
+            recommendations = data.get("recommendations", [])
+            if metrics or recommendations:
+                return {"metrics": metrics, "recommendations": recommendations}
         except Exception:
-            return {"metrics": [], "recommendations": [resp.content if "resp" in dir() else "Analysis complete."]}
+            pass
+        # Fallback: extract any bullet lines as recommendations, show raw as one rec
+        lines = [l.strip("- •*").strip() for l in raw.splitlines() if l.strip()]
+        recs = [l for l in lines if len(l) > 20][:5]
+        return {"metrics": [], "recommendations": recs if recs else [raw[:500]]}
 
     # ── Conditional routing ───────────────────────────────────────────────────
     def route_evaluator(state: AgentState) -> str:
@@ -398,9 +404,15 @@ if question:
                 "error": None,
             }
 
+            # Accumulate the full state across all node updates
+            merged_state = dict(initial_state)
+
             with st.status("🤔 Starting analysis...", expanded=True) as status:
                 for event in graph.stream(initial_state, stream_mode="updates"):
                     for node_name, node_output in event.items():
+                        # Merge this node's output into the running state
+                        merged_state.update(node_output)
+
                         label = NODE_LABELS.get(node_name, f"Running {node_name}...")
                         status.update(label=f"⚙️ {label}")
 
@@ -430,13 +442,14 @@ if question:
                                 })
 
                         elif node_name == "advisor":
-                            final_state = node_output
                             status.update(label="✅ Analysis complete", state="complete")
+
+            final_state = merged_state
 
         except Exception as e:
             st.error(f"Agent error: {e}")
 
-        if final_state:
+        if final_state.get("metrics") or final_state.get("recommendations") or step_dfs:
             _render_report(final_state, step_dfs)
             st.session_state["agent_history"].append({
                 "question": question,
