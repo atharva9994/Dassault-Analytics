@@ -41,9 +41,10 @@ if not api_key:
 class AgentState(TypedDict):
     question: str
     plan: str
-    data_results: List[dict]   # [{step, description, result_str}]
+    data_results: List[dict]
     sufficient: bool
-    metrics: List[dict]        # [{label, value}]
+    metrics: List[dict]
+    findings: List[str]
     recommendations: List[str]
     loop_count: int
     error: Optional[str]
@@ -55,7 +56,6 @@ def _extract_json(raw: str) -> dict:
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fenced:
         text = fenced.group(1).strip()
-    # Bracket-counter: find the first complete {...}
     start = text.find("{")
     if start == -1:
         raise ValueError("No JSON object found")
@@ -78,12 +78,216 @@ def _extract_json(raw: str) -> dict:
     raise ValueError("Unmatched braces")
 
 
+# ── Formatting helpers ────────────────────────────────────────────────────────
+_COL_LABELS = {
+    "Deal_Value_USD": "Revenue ($)",
+    "deal_value_usd": "Revenue ($)",
+    "Number_of_Seats": "Seats",
+    "Seats": "Seats",
+    "Usage_Hours_Per_Month": "Usage (hrs/mo)",
+    "Churn_Risk": "Churn Risk",
+    "Deal_Stage": "Deal Stage",
+    "License_Type": "License Type",
+    "Customer_Segment": "Segment",
+    "Customer_Name": "Customer",
+    "Booking_Date": "Booking Date",
+}
+
+def _rename_cols(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(columns={c: _COL_LABELS.get(c, c) for c in df.columns})
+
+def _fmt_revenue_col(series: pd.Series) -> pd.Series:
+    """Format a numeric revenue series as $X.XM or $X,XXX."""
+    def _fmt(v):
+        try:
+            v = float(v)
+            if v >= 1_000_000:
+                return f"${v / 1_000_000:.1f}M"
+            return f"${v:,.0f}"
+        except Exception:
+            return str(v)
+    return series.apply(_fmt)
+
+def _fmt_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns and format revenue/dollar columns for display."""
+    out = _rename_cols(df.head(20).copy())
+    for col in out.columns:
+        low = col.lower()
+        if any(k in low for k in ["revenue", "value", "amount"]):
+            if pd.api.types.is_numeric_dtype(out[col]):
+                out[col] = _fmt_revenue_col(out[col])
+    return out
+
+
+# ── Safe chart helpers ────────────────────────────────────────────────────────
+def _best_cat_num(df: pd.DataFrame):
+    """Pick the best categorical and numeric columns, excluding Deal_ID."""
+    skip = {"deal_id", "id", "index"}
+    cat_cols = [c for c in df.columns
+                if df[c].dtype == object and c.lower() not in skip]
+    num_cols = [c for c in df.columns
+                if pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in skip]
+    return cat_cols, num_cols
+
+
+def _safe_bar(raw_df: pd.DataFrame, title: str) -> None:
+    """Horizontal bar chart: top 10 by numeric value, renamed columns, no gridlines."""
+    try:
+        cat_cols, num_cols = _best_cat_num(raw_df)
+        if not cat_cols or not num_cols:
+            return
+        df = raw_df.copy()
+        num_col, cat_col = num_cols[0], cat_cols[0]
+        df = df[[cat_col, num_col]].dropna()
+        df = df.nlargest(10, num_col)
+        df = _rename_cols(df)
+        cat_col_r, num_col_r = df.columns[0], df.columns[1]
+
+        fig = px.bar(
+            df, x=num_col_r, y=cat_col_r, orientation="h",
+            title=title, color=num_col_r, color_continuous_scale="Blues",
+            text=num_col_r,
+        )
+        fig.update_layout(
+            coloraxis_showscale=False,
+            yaxis={"categoryorder": "total ascending"},
+            xaxis_showgrid=False, yaxis_showgrid=False,
+            margin={"t": 45, "b": 10, "l": 10, "r": 10},
+            height=max(280, len(df) * 38 + 80),
+            plot_bgcolor="white",
+        )
+        fig.update_traces(
+            texttemplate="%{text:,.0f}",
+            textposition="outside",
+            marker_line_width=0,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+
+def _safe_pie(raw_df: pd.DataFrame, title: str) -> None:
+    """Pie chart: top 5 slices + 'Others', renamed columns."""
+    try:
+        cat_cols, num_cols = _best_cat_num(raw_df)
+        if not cat_cols or not num_cols:
+            return
+        df = raw_df[[cat_cols[0], num_cols[0]]].dropna().copy()
+        df.columns = ["Category", "Value"]
+        df = df.groupby("Category", as_index=False)["Value"].sum()
+        df = df.sort_values("Value", ascending=False)
+
+        if len(df) > 6:
+            top5 = df.head(5)
+            others_val = df.iloc[5:]["Value"].sum()
+            others_row = pd.DataFrame([{"Category": "Others", "Value": others_val}])
+            df = pd.concat([top5, others_row], ignore_index=True)
+
+        fig = px.pie(
+            df, names="Category", values="Value", title=title,
+            color_discrete_sequence=px.colors.sequential.Blues_r,
+        )
+        fig.update_layout(margin={"t": 45, "b": 10, "l": 10, "r": 10})
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+
+# ── Metrics renderer ──────────────────────────────────────────────────────────
+def _render_metrics(metrics: list) -> None:
+    if not metrics:
+        return
+    for row_start in range(0, len(metrics), 2):
+        row = metrics[row_start: row_start + 2]
+        cols = st.columns(2)
+        for col, m in zip(cols, row):
+            label, value = m.get("label", ""), m.get("value", "")
+            if len(value) <= 18 and not any(c.isalpha() and c not in "$%KMB" for c in value):
+                col.metric(label, value)
+            else:
+                col.markdown(
+                    f"""<div style="background:#f0f2f6;padding:12px 16px;border-radius:8px;margin-bottom:8px;">
+<p style="margin:0;font-size:13px;color:#666;">{label}</p>
+<p style="margin:0;font-size:16px;font-weight:500;word-break:break-word;">{value}</p>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+    st.markdown("")
+
+
+# ── Main report renderer ──────────────────────────────────────────────────────
+def _render_report(final_state: dict, step_dfs: dict) -> None:
+    metrics = final_state.get("metrics", [])
+    findings = final_state.get("findings", [])
+    recommendations = final_state.get("recommendations", [])
+
+    # Guard: nothing to show
+    if not metrics and not findings and not recommendations and not step_dfs:
+        st.info("No data found for this query. Try a different question.")
+        return
+
+    st.markdown("---")
+
+    # ── 1. Executive Summary ──────────────────────────────────────────────────
+    st.subheader("Executive Summary")
+    _render_metrics(metrics)
+
+    # ── 2. Key Findings ───────────────────────────────────────────────────────
+    if findings:
+        st.subheader("Key Findings")
+        for f in findings:
+            st.markdown(f"- {f}")
+        st.markdown("")
+
+    # ── 3. Charts ─────────────────────────────────────────────────────────────
+    # Pick the DataFrame with the most numeric content as the chart source
+    chart_df = None
+    for result in step_dfs.values():
+        if not isinstance(result, pd.DataFrame) or result.empty:
+            continue
+        cat_c, num_c = _best_cat_num(result)
+        if cat_c and num_c:
+            if chart_df is None or len(result) > len(chart_df):
+                chart_df = result
+
+    if chart_df is not None:
+        st.subheader("Charts")
+        c1, c2 = st.columns(2)
+        with c1:
+            _safe_bar(chart_df, "Top 10 by Value")
+        with c2:
+            _safe_pie(chart_df, "Distribution")
+
+    # ── 4. Recommendations ────────────────────────────────────────────────────
+    if recommendations:
+        st.subheader("Recommendations")
+        for rec in recommendations:
+            st.info(rec)
+
+    # ── 5. Detailed Data (collapsed) ──────────────────────────────────────────
+    all_dfs = [r for r in step_dfs.values() if isinstance(r, pd.DataFrame) and not r.empty]
+    if all_dfs:
+        with st.expander("View detailed data", expanded=False):
+            for i, d in enumerate(all_dfs):
+                if len(all_dfs) > 1:
+                    st.caption(f"Dataset {i + 1}")
+                st.dataframe(_fmt_display_df(d), use_container_width=True, hide_index=True)
+
+
 # ── Graph builder ─────────────────────────────────────────────────────────────
+_ANALYST_BASE = """You are a senior business analyst at Dassault Systèmes.
+Rules:
+- ALWAYS aggregate data by business categories (Customer_Name, Product, Region, Industry, License_Type, Customer_Segment) — NEVER by Deal_ID
+- ALWAYS use .nlargest(10) or .head(10) to limit results to at most 10 rows
+- Sort results descending by the main numeric column
+- Use Deal_Value_USD for revenue; never leave raw floats — round to 2 decimal places
+- Return a clean DataFrame with at most 5 columns
+- Focus on business insight: totals, averages, counts, rankings
+- Return ONLY valid JSON, nothing else"""
+
+
 def build_graph(api_key: str, df: pd.DataFrame):
-    """
-    Returns (compiled_graph, step_dfs) where step_dfs is a shared dict
-    that analyst_node populates with DataFrames keyed by step number.
-    """
     llm = ChatAnthropic(model="claude-sonnet-4-6", api_key=api_key, max_tokens=2048)
     cols = ", ".join(df.columns.tolist())
     sample = df.head(3).to_string(index=False)
@@ -93,12 +297,12 @@ def build_graph(api_key: str, df: pd.DataFrame):
     def planner_node(state: AgentState) -> dict:
         try:
             resp = llm.invoke([
-                SystemMessage(content=f"""You are a data analyst for Dassault Systèmes.
+                SystemMessage(content=f"""{_ANALYST_BASE}
 Dataset columns: {cols}
 Sample:
 {sample}
 
-Return ONLY a JSON object describing the analysis plan:
+Return ONLY a JSON object:
 {{"steps": ["Step 1: ...", "Step 2: ..."], "description": "Brief plan summary"}}"""),
                 HumanMessage(content=f"Plan the analysis for: {state['question']}"),
             ])
@@ -117,24 +321,25 @@ Return ONLY a JSON object describing the analysis plan:
 
         try:
             resp = llm.invoke([
-                SystemMessage(content=f"""You are a Python/Pandas analyst.
+                SystemMessage(content=f"""{_ANALYST_BASE}
 Dataset columns: {cols}
 Sample:
 {sample}
 
-Return ONLY a JSON object for the NEXT pandas query needed:
-{{"description": "What this query computes", "code": "result = df.groupby('Product')['Deal_Value_USD'].sum().reset_index()"}}
+Return ONLY a JSON object for the NEXT pandas query:
+{{"description": "What this query computes", "code": "result = df.groupby('Product')['Deal_Value_USD'].sum().nlargest(10).reset_index()"}}
 
-Rules:
-- `code` must store output in a variable named `result`
-- result must be a DataFrame (max 10 rows, max 5 columns) or a scalar
-- Use exact column names from the dataset
-- Return ONLY valid JSON, nothing else"""),
+Critical rules for the code:
+- Store output in variable `result`
+- result = DataFrame (max 10 rows, max 5 columns) OR scalar
+- Group by business columns only — never by Deal_ID
+- Always sort descending and limit to top 10
+- Use exact column names from the dataset"""),
                 HumanMessage(content=(
                     f"Question: {state['question']}\n\n"
                     f"Plan:\n{state['plan']}\n\n"
                     f"Previous results:\n{prev}\n\n"
-                    "Generate the next pandas query needed to answer the question."
+                    "Generate the next pandas query."
                 )),
             ])
             data = _extract_json(resp.content)
@@ -152,7 +357,7 @@ Rules:
                 exec(code, {}, local_vars)
                 result = local_vars.get("result")
                 if isinstance(result, pd.DataFrame):
-                    step_dfs[step_num] = result
+                    step_dfs[step_num] = result.head(10)
                     result_str = result.head(10).to_string(index=False)
                 elif result is not None:
                     step_dfs[step_num] = result
@@ -178,13 +383,13 @@ Rules:
                 SystemMessage(content='Reply with ONLY one word: "sufficient" or "need_more"'),
                 HumanMessage(content=(
                     f"Question: {state['question']}\n\n"
-                    f"Data collected so far:\n{summary}\n\n"
+                    f"Data collected:\n{summary}\n\n"
                     "Is this enough to give specific, data-backed business recommendations?"
                 )),
             ])
             sufficient = "sufficient" in resp.content.lower()
         except Exception:
-            sufficient = True  # on error, proceed to advisor
+            sufficient = True
         return {"sufficient": sufficient}
 
     # ── Node 4: Advisor ───────────────────────────────────────────────────────
@@ -194,53 +399,58 @@ Rules:
             for r in state["data_results"]
         )
         resp = llm.invoke([
-            SystemMessage(content=f"""You are a senior business advisor for Dassault Systèmes.
+            SystemMessage(content=f"""{_ANALYST_BASE}
+
 Return ONLY a JSON object with this exact structure:
 {{
   "metrics": [
-    {{"label": "Total Revenue at Risk", "value": "$2,450,000"}},
-    {{"label": "High-Risk Customers", "value": "12"}}
+    {{"label": "Total Revenue", "value": "$101.6M"}},
+    {{"label": "High-Risk Accounts", "value": "12"}}
+  ],
+  "findings": [
+    "CATIA accounts for 29% of total revenue ($101.6M)",
+    "EMEA region shows highest churn risk with 4 of 12 high-risk accounts"
   ],
   "recommendations": [
-    "Prioritise CATIA renewal outreach in EMEA — 6 accounts, $1.2M at stake",
-    "Offer usage training to accounts with low engagement before renewal"
+    "Prioritize renewal outreach for the 12 high-risk CATIA accounts in EMEA — $2.4M at stake",
+    "Investigate low usage in North America subscription accounts before next renewal cycle"
   ]
 }}
 
 Rules:
-- metrics: 2–4 key numbers pulled from the actual data results above
-- recommendations: 2–4 short actionable bullets with specific numbers from the data
-- RETURN ONLY THE JSON OBJECT. No explanation, no markdown, no extra text."""),
-            HumanMessage(content=f"Question: {state['question']}\n\nData collected:\n{full_data}"),
+- metrics: 2–4 key numbers from the data (format as $X.XM or plain number)
+- findings: 3–4 specific data-backed statements with real numbers and percentages
+- recommendations: 3–4 short action-oriented bullets (start with verb: Prioritize/Investigate/Schedule/Consider)
+- Every number must come from the actual data results, not made up
+- RETURN ONLY THE JSON OBJECT. No markdown, no explanation."""),
+            HumanMessage(content=f"Question: {state['question']}\n\nData:\n{full_data}"),
         ])
         raw = resp.content.strip()
-        # Try structured parse first
         try:
             data = _extract_json(raw)
-            metrics = data.get("metrics", [])
-            recommendations = data.get("recommendations", [])
-            if metrics or recommendations:
-                return {"metrics": metrics, "recommendations": recommendations}
+            result = {
+                "metrics": data.get("metrics", []),
+                "findings": data.get("findings", []),
+                "recommendations": data.get("recommendations", []),
+            }
+            if any(result.values()):
+                return result
         except Exception:
             pass
-        # Fallback: extract any bullet lines as recommendations, show raw as one rec
-        lines = [l.strip("- •*").strip() for l in raw.splitlines() if l.strip()]
-        recs = [l for l in lines if len(l) > 20][:5]
-        return {"metrics": [], "recommendations": recs if recs else [raw[:500]]}
+        # Fallback: treat response lines as findings/recommendations
+        lines = [l.strip("- •*").strip() for l in raw.splitlines() if len(l.strip()) > 20]
+        return {"metrics": [], "findings": [], "recommendations": lines[:5]}
 
-    # ── Conditional routing ───────────────────────────────────────────────────
+    # ── Routing ───────────────────────────────────────────────────────────────
     def route_evaluator(state: AgentState) -> str:
-        if state["sufficient"] or state["loop_count"] >= 3:
-            return "advisor"
-        return "analyst"
+        return "advisor" if (state["sufficient"] or state["loop_count"] >= 3) else "analyst"
 
-    # ── Assemble graph ────────────────────────────────────────────────────────
+    # ── Assemble ──────────────────────────────────────────────────────────────
     graph = StateGraph(AgentState)
     graph.add_node("planner", planner_node)
     graph.add_node("analyst", analyst_node)
     graph.add_node("evaluator", evaluator_node)
     graph.add_node("advisor", advisor_node)
-
     graph.set_entry_point("planner")
     graph.add_edge("planner", "analyst")
     graph.add_edge("analyst", "evaluator")
@@ -249,94 +459,7 @@ Rules:
         "advisor": "advisor",
     })
     graph.add_edge("advisor", END)
-
     return graph.compile(), step_dfs
-
-
-# ── Visual helpers ────────────────────────────────────────────────────────────
-def _auto_bar(result_df: pd.DataFrame, title: str) -> None:
-    cat_cols = [c for c in result_df.columns if result_df[c].dtype == object]
-    num_cols = [c for c in result_df.columns if pd.api.types.is_numeric_dtype(result_df[c])]
-    if not cat_cols or not num_cols:
-        return
-    fig = px.bar(result_df, x=num_cols[0], y=cat_cols[0], orientation="h",
-                 title=title, color=num_cols[0], color_continuous_scale="Blues",
-                 text=num_cols[0])
-    fig.update_layout(coloraxis_showscale=False,
-                      yaxis={"categoryorder": "total ascending"},
-                      margin={"t": 40, "b": 20},
-                      height=max(300, len(result_df) * 40 + 80))
-    fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _auto_pie(result_df: pd.DataFrame, title: str) -> None:
-    cat_cols = [c for c in result_df.columns if result_df[c].dtype == object]
-    num_cols = [c for c in result_df.columns if pd.api.types.is_numeric_dtype(result_df[c])]
-    if not cat_cols or not num_cols:
-        return
-    fig = px.pie(result_df, names=cat_cols[0], values=num_cols[0], title=title,
-                 color_discrete_sequence=px.colors.sequential.Blues_r)
-    fig.update_layout(margin={"t": 40, "b": 20})
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _render_metrics(metrics: list) -> None:
-    if not metrics:
-        return
-    for row_start in range(0, len(metrics), 2):
-        row = metrics[row_start: row_start + 2]
-        cols = st.columns(2)
-        for col, m in zip(cols, row):
-            label, value = m.get("label", ""), m.get("value", "")
-            if len(value) <= 18 and not any(c.isalpha() and c not in "$%KMB" for c in value):
-                col.metric(label, value)
-            else:
-                col.markdown(
-                    f"""<div style="background:#f0f2f6;padding:12px 16px;border-radius:8px;margin-bottom:8px;">
-<p style="margin:0;font-size:13px;color:#666;">{label}</p>
-<p style="margin:0;font-size:16px;font-weight:500;word-break:break-word;">{value}</p>
-</div>""",
-                    unsafe_allow_html=True,
-                )
-    st.markdown("")
-
-
-def _render_report(final_state: dict, step_dfs: dict) -> None:
-    st.markdown("---")
-    st.markdown("### Executive Summary")
-
-    _render_metrics(final_state.get("metrics", []))
-
-    # Charts — use largest DataFrame available
-    chart_df = None
-    for result in step_dfs.values():
-        if isinstance(result, pd.DataFrame) and not result.empty:
-            if chart_df is None or len(result) > len(chart_df):
-                chart_df = result
-
-    if chart_df is not None:
-        cat_count = sum(1 for c in chart_df.columns if chart_df[c].dtype == object)
-        num_count = sum(1 for c in chart_df.columns if pd.api.types.is_numeric_dtype(chart_df[c]))
-        if cat_count >= 1 and num_count >= 1:
-            c1, c2 = st.columns(2)
-            with c1:
-                _auto_bar(chart_df, "Value Breakdown")
-            with c2:
-                _auto_pie(chart_df, "Distribution")
-        with st.expander("View data table", expanded=False):
-            st.dataframe(chart_df, use_container_width=True, hide_index=True)
-
-    # Other step dataframes
-    for step_num, result in step_dfs.items():
-        if result is chart_df:
-            continue
-        if isinstance(result, pd.DataFrame) and not result.empty:
-            with st.expander(f"Step {step_num} data", expanded=False):
-                st.dataframe(result, use_container_width=True, hide_index=True)
-
-    for rec in final_state.get("recommendations", []):
-        st.info(rec)
 
 
 # ── Example questions ─────────────────────────────────────────────────────────
@@ -369,7 +492,7 @@ for entry in st.session_state["agent_history"]:
         for log in entry.get("steps_log", []):
             with st.expander(log["label"], expanded=False):
                 if log.get("df") is not None:
-                    st.dataframe(log["df"], use_container_width=True, hide_index=True)
+                    st.dataframe(_fmt_display_df(log["df"]), use_container_width=True, hide_index=True)
                 elif log.get("text"):
                     st.markdown(log["text"])
         _render_report(entry["final_state"], entry["step_dfs"])
@@ -388,7 +511,7 @@ if question:
 
     with st.chat_message("assistant"):
         steps_log = []
-        final_state = {}
+        merged_state = {}
 
         try:
             graph, step_dfs = build_graph(api_key, df)
@@ -399,22 +522,18 @@ if question:
                 "data_results": [],
                 "sufficient": False,
                 "metrics": [],
+                "findings": [],
                 "recommendations": [],
                 "loop_count": 0,
                 "error": None,
             }
-
-            # Accumulate the full state across all node updates
             merged_state = dict(initial_state)
 
             with st.status("🤔 Starting analysis...", expanded=True) as status:
                 for event in graph.stream(initial_state, stream_mode="updates"):
                     for node_name, node_output in event.items():
-                        # Merge this node's output into the running state
                         merged_state.update(node_output)
-
-                        label = NODE_LABELS.get(node_name, f"Running {node_name}...")
-                        status.update(label=f"⚙️ {label}")
+                        status.update(label=f"⚙️ {NODE_LABELS.get(node_name, node_name)}...")
 
                         if node_name == "planner" and node_output.get("plan"):
                             with st.expander("📋 Plan", expanded=False):
@@ -430,7 +549,7 @@ if question:
                                 exp_label = f"📊 Step {step_num}: {latest['description']}"
                                 with st.expander(exp_label, expanded=False):
                                     if isinstance(step_df, pd.DataFrame):
-                                        st.dataframe(step_df, use_container_width=True, hide_index=True)
+                                        st.dataframe(_fmt_display_df(step_df), use_container_width=True, hide_index=True)
                                     elif step_df is not None:
                                         st.metric("Result", str(step_df))
                                     else:
@@ -444,17 +563,16 @@ if question:
                         elif node_name == "advisor":
                             status.update(label="✅ Analysis complete", state="complete")
 
-            final_state = merged_state
-
         except Exception as e:
-            st.error(f"Agent error: {e}")
+            st.error(f"Something went wrong — please try a different question.")
 
-        if final_state.get("metrics") or final_state.get("recommendations") or step_dfs:
-            _render_report(final_state, step_dfs)
+        _render_report(merged_state, step_dfs)
+
+        if merged_state.get("data_results") or merged_state.get("recommendations"):
             st.session_state["agent_history"].append({
                 "question": question,
                 "steps_log": steps_log,
-                "final_state": final_state,
+                "final_state": merged_state,
                 "step_dfs": step_dfs,
             })
 
