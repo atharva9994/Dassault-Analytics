@@ -1,16 +1,20 @@
 import streamlit as st
-import anthropic
 import pandas as pd
 import plotly.express as px
-import json
 import re
+import json
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from chat_sidebar import render_chat_sidebar
 
+from typing import TypedDict, List, Optional
+from langgraph.graph import StateGraph, END
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+
 st.set_page_config(page_title="AI Agent", page_icon="🤖", layout="wide")
 st.title("AI Agent")
-st.caption("Ask complex multi-step questions. The agent breaks them down, runs real computations, and returns a visual executive report.")
+st.caption("Ask complex multi-step questions. The agent plans, queries, evaluates, and returns a visual executive report.")
 
 if "data" not in st.session_state:
     st.warning("No data loaded. Please upload a file on the Home page.")
@@ -33,136 +37,234 @@ if not api_key:
         st.stop()
 
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-def _build_agent_prompt(df: pd.DataFrame) -> str:
-    cols = ", ".join(df.columns.tolist())
-    sample = df.head(3).to_string(index=False)
-    return f"""You are an AI data analyst for Dassault Systèmes with access to a license sales dataset.
-
-Columns available: {cols}
-
-Sample rows:
-{sample}
-
-IMPORTANT: Your ENTIRE response must be exactly ONE valid JSON object. No text before it, no text after it, no multiple JSON objects, no markdown fences. One JSON object only.
-
-Reason through the question step by step. For EVERY step respond with ONLY a valid JSON object — no markdown, no text outside the JSON.
-
-Intermediate step format:
-{{
-  "step_number": 1,
-  "step_description": "Short description of what this step computes",
-  "pandas_code": "result = df.groupby('Product')['Deal_Value_USD'].sum().reset_index()",
-  "is_final": false
-}}
-
-Final step format — return structured data, NOT a text summary:
-{{
-  "step_number": 4,
-  "step_description": "Executive Summary",
-  "is_final": true,
-  "metrics": [
-    {{"label": "Total Revenue at Risk", "value": "$2,450,000"}},
-    {{"label": "High-Risk Customers", "value": "12"}},
-    {{"label": "Medium-Risk Customers", "value": "28"}}
-  ],
-  "chart_step": 2,
-  "warnings": [
-    "12 high-risk customers represent $2.4M in immediate churn exposure"
-  ],
-  "recommendations": [
-    "Prioritise CATIA renewal outreach in EMEA — 6 accounts, $1.2M at stake",
-    "Offer usage training to low-engagement accounts before renewal dates"
-  ]
-}}
-
-Rules:
-- Respond ONLY with a valid JSON object, nothing else
-- pandas_code must store output in a variable named `result`
-- result must be a pandas DataFrame (max 10 rows, max 5 columns) or a scalar
-- Use exact column names from the dataset
-- Revenue = Deal_Value_USD column
-- metrics must use real numbers from step results — never generic placeholders
-- warnings: 1–3 urgent, specific, data-backed alerts
-- recommendations: 2–4 short actionable bullets (1–2 lines each)
-- chart_step: the step number whose result dataframe is most suitable for a bar chart
-- 2 to 5 steps is sufficient"""
+# ── LangGraph state schema ────────────────────────────────────────────────────
+class AgentState(TypedDict):
+    question: str
+    plan: str
+    data_results: List[dict]   # [{step, description, result_str}]
+    sufficient: bool
+    metrics: List[dict]        # [{label, value}]
+    recommendations: List[str]
+    loop_count: int
+    error: Optional[str]
 
 
-# ── JSON parser ───────────────────────────────────────────────────────────────
-def _extract_first_json(text: str) -> str:
-    """Return the substring of text that is exactly the first complete {...} object."""
+# ── JSON extraction helper ────────────────────────────────────────────────────
+def _extract_json(raw: str) -> dict:
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fenced:
+        text = fenced.group(1).strip()
+    # Bracket-counter: find the first complete {...}
     start = text.find("{")
     if start == -1:
-        raise ValueError("No '{' found in response")
-    depth = 0
-    in_string = False
-    escape = False
+        raise ValueError("No JSON object found")
+    depth, in_str, escape = 0, False, False
     for i, ch in enumerate(text[start:], start):
         if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
+            escape = False; continue
+        if ch == "\\" and in_str:
+            escape = True; continue
         if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
+            in_str = not in_str; continue
+        if in_str:
             continue
         if ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return text[start : i + 1]
-    raise ValueError("Unmatched braces — no complete JSON object found")
+                return json.loads(text[start: i + 1])
+    raise ValueError("Unmatched braces")
 
 
-def _parse_json(raw: str) -> dict:
-    text = raw.strip()
-    # Unwrap ```json ... ``` fences if present
-    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fenced:
-        text = fenced.group(1).strip()
-    # Extract the first complete {...} using a bracket counter (handles multiple objects)
-    json_str = _extract_first_json(text)
-    return json.loads(json_str)
+# ── Graph builder ─────────────────────────────────────────────────────────────
+def build_graph(api_key: str, df: pd.DataFrame):
+    """
+    Returns (compiled_graph, step_dfs) where step_dfs is a shared dict
+    that analyst_node populates with DataFrames keyed by step number.
+    """
+    llm = ChatAnthropic(model="claude-sonnet-4-6", api_key=api_key, max_tokens=2048)
+    cols = ", ".join(df.columns.tolist())
+    sample = df.head(3).to_string(index=False)
+    step_dfs: dict = {}
+
+    # ── Node 1: Planner ───────────────────────────────────────────────────────
+    def planner_node(state: AgentState) -> dict:
+        try:
+            resp = llm.invoke([
+                SystemMessage(content=f"""You are a data analyst for Dassault Systèmes.
+Dataset columns: {cols}
+Sample:
+{sample}
+
+Return ONLY a JSON object describing the analysis plan:
+{{"steps": ["Step 1: ...", "Step 2: ..."], "description": "Brief plan summary"}}"""),
+                HumanMessage(content=f"Plan the analysis for: {state['question']}"),
+            ])
+            data = _extract_json(resp.content)
+            plan = "\n".join(data.get("steps", [resp.content]))
+        except Exception:
+            plan = f"Analyse: {state['question']}"
+        return {"plan": plan}
+
+    # ── Node 2: Analyst ───────────────────────────────────────────────────────
+    def analyst_node(state: AgentState) -> dict:
+        prev = "\n".join(
+            f"Step {r['step']}: {r['description']}\nResult (first 400 chars): {r['result_str'][:400]}"
+            for r in state["data_results"]
+        ) or "None yet"
+
+        try:
+            resp = llm.invoke([
+                SystemMessage(content=f"""You are a Python/Pandas analyst.
+Dataset columns: {cols}
+Sample:
+{sample}
+
+Return ONLY a JSON object for the NEXT pandas query needed:
+{{"description": "What this query computes", "code": "result = df.groupby('Product')['Deal_Value_USD'].sum().reset_index()"}}
+
+Rules:
+- `code` must store output in a variable named `result`
+- result must be a DataFrame (max 10 rows, max 5 columns) or a scalar
+- Use exact column names from the dataset
+- Return ONLY valid JSON, nothing else"""),
+                HumanMessage(content=(
+                    f"Question: {state['question']}\n\n"
+                    f"Plan:\n{state['plan']}\n\n"
+                    f"Previous results:\n{prev}\n\n"
+                    "Generate the next pandas query needed to answer the question."
+                )),
+            ])
+            data = _extract_json(resp.content)
+            description = data.get("description", "Analysis step")
+            code = data.get("code", "")
+        except Exception as e:
+            return {"data_results": state["data_results"], "loop_count": state["loop_count"] + 1, "error": str(e)}
+
+        result_str = "No result"
+        step_num = len(state["data_results"]) + 1
+
+        if code:
+            try:
+                local_vars = {"df": df.copy(), "pd": pd}
+                exec(code, {}, local_vars)
+                result = local_vars.get("result")
+                if isinstance(result, pd.DataFrame):
+                    step_dfs[step_num] = result
+                    result_str = result.head(10).to_string(index=False)
+                elif result is not None:
+                    step_dfs[step_num] = result
+                    result_str = str(result)
+            except Exception as e:
+                result_str = f"Execution error: {e}"
+
+        new_results = state["data_results"] + [{
+            "step": step_num,
+            "description": description,
+            "result_str": result_str,
+        }]
+        return {"data_results": new_results, "loop_count": state["loop_count"] + 1}
+
+    # ── Node 3: Evaluator ─────────────────────────────────────────────────────
+    def evaluator_node(state: AgentState) -> dict:
+        summary = "\n".join(
+            f"Step {r['step']}: {r['description']}\n{r['result_str'][:300]}"
+            for r in state["data_results"]
+        )
+        try:
+            resp = llm.invoke([
+                SystemMessage(content='Reply with ONLY one word: "sufficient" or "need_more"'),
+                HumanMessage(content=(
+                    f"Question: {state['question']}\n\n"
+                    f"Data collected so far:\n{summary}\n\n"
+                    "Is this enough to give specific, data-backed business recommendations?"
+                )),
+            ])
+            sufficient = "sufficient" in resp.content.lower()
+        except Exception:
+            sufficient = True  # on error, proceed to advisor
+        return {"sufficient": sufficient}
+
+    # ── Node 4: Advisor ───────────────────────────────────────────────────────
+    def advisor_node(state: AgentState) -> dict:
+        full_data = "\n\n".join(
+            f"Step {r['step']}: {r['description']}\n{r['result_str']}"
+            for r in state["data_results"]
+        )
+        try:
+            resp = llm.invoke([
+                SystemMessage(content=f"""You are a senior business advisor for Dassault Systèmes.
+Return ONLY a JSON object:
+{{
+  "metrics": [
+    {{"label": "Total Revenue at Risk", "value": "$2,450,000"}},
+    {{"label": "High-Risk Customers", "value": "12"}}
+  ],
+  "recommendations": [
+    "Prioritise CATIA renewal outreach in EMEA — 6 accounts, $1.2M at stake",
+    "Offer usage training to accounts with low engagement before renewal"
+  ]
+}}
+
+Rules:
+- metrics: 2–4 key numbers extracted from the actual data results
+- recommendations: 2–4 short actionable bullets (1–2 lines each) with real numbers
+- Return ONLY valid JSON"""),
+                HumanMessage(content=f"Question: {state['question']}\n\nData:\n{full_data}"),
+            ])
+            data = _extract_json(resp.content)
+            return {
+                "metrics": data.get("metrics", []),
+                "recommendations": data.get("recommendations", []),
+            }
+        except Exception:
+            return {"metrics": [], "recommendations": [resp.content if "resp" in dir() else "Analysis complete."]}
+
+    # ── Conditional routing ───────────────────────────────────────────────────
+    def route_evaluator(state: AgentState) -> str:
+        if state["sufficient"] or state["loop_count"] >= 3:
+            return "advisor"
+        return "analyst"
+
+    # ── Assemble graph ────────────────────────────────────────────────────────
+    graph = StateGraph(AgentState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("analyst", analyst_node)
+    graph.add_node("evaluator", evaluator_node)
+    graph.add_node("advisor", advisor_node)
+
+    graph.set_entry_point("planner")
+    graph.add_edge("planner", "analyst")
+    graph.add_edge("analyst", "evaluator")
+    graph.add_conditional_edges("evaluator", route_evaluator, {
+        "analyst": "analyst",
+        "advisor": "advisor",
+    })
+    graph.add_edge("advisor", END)
+
+    return graph.compile(), step_dfs
 
 
-# ── Chart helper ──────────────────────────────────────────────────────────────
+# ── Visual helpers ────────────────────────────────────────────────────────────
 def _auto_bar(result_df: pd.DataFrame, title: str) -> None:
-    """Plot the first categorical + first numeric column as a horizontal bar chart."""
-    if result_df is None or result_df.empty:
-        return
     cat_cols = [c for c in result_df.columns if result_df[c].dtype == object]
     num_cols = [c for c in result_df.columns if pd.api.types.is_numeric_dtype(result_df[c])]
     if not cat_cols or not num_cols:
         return
-    fig = px.bar(
-        result_df,
-        x=num_cols[0],
-        y=cat_cols[0],
-        orientation="h",
-        title=title,
-        color=num_cols[0],
-        color_continuous_scale="Blues",
-        text=num_cols[0],
-    )
-    fig.update_layout(
-        coloraxis_showscale=False,
-        yaxis={"categoryorder": "total ascending"},
-        margin={"t": 40, "b": 20},
-        height=max(300, len(result_df) * 40 + 80),
-    )
+    fig = px.bar(result_df, x=num_cols[0], y=cat_cols[0], orientation="h",
+                 title=title, color=num_cols[0], color_continuous_scale="Blues",
+                 text=num_cols[0])
+    fig.update_layout(coloraxis_showscale=False,
+                      yaxis={"categoryorder": "total ascending"},
+                      margin={"t": 40, "b": 20},
+                      height=max(300, len(result_df) * 40 + 80))
     fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _auto_pie(result_df: pd.DataFrame, title: str) -> None:
-    """Plot a pie chart from a two-column df (label + value)."""
-    if result_df is None or result_df.empty:
-        return
     cat_cols = [c for c in result_df.columns if result_df[c].dtype == object]
     num_cols = [c for c in result_df.columns if pd.api.types.is_numeric_dtype(result_df[c])]
     if not cat_cols or not num_cols:
@@ -173,212 +275,62 @@ def _auto_pie(result_df: pd.DataFrame, title: str) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ── Final visual renderer ─────────────────────────────────────────────────────
-def _render_final(final_event: dict, step_results: dict) -> None:
-    """Render the final structured JSON as a professional visual report."""
-    st.markdown("---")
-    st.markdown(f"### {final_event['description']}")
-
-    # Metrics row
-    metrics = final_event.get("metrics", [])
-    if metrics:
-        # Split into rows of 2 so cards have enough width for long text
-        for row_start in range(0, len(metrics), 2):
-            row = metrics[row_start : row_start + 2]
-            cols = st.columns(2)
-            for col, m in zip(cols, row):
-                label = m.get("label", "")
-                value = m.get("value", "")
-                # Use st.metric only for pure numbers / short values (≤18 chars)
-                if len(value) <= 18 and not any(c.isalpha() and c not in "$%KMB" for c in value):
-                    col.metric(label, value)
-                else:
-                    col.markdown(
-                        f"""<div style="background:#f0f2f6;padding:12px 16px;border-radius:8px;margin-bottom:8px;">
+def _render_metrics(metrics: list) -> None:
+    if not metrics:
+        return
+    for row_start in range(0, len(metrics), 2):
+        row = metrics[row_start: row_start + 2]
+        cols = st.columns(2)
+        for col, m in zip(cols, row):
+            label, value = m.get("label", ""), m.get("value", "")
+            if len(value) <= 18 and not any(c.isalpha() and c not in "$%KMB" for c in value):
+                col.metric(label, value)
+            else:
+                col.markdown(
+                    f"""<div style="background:#f0f2f6;padding:12px 16px;border-radius:8px;margin-bottom:8px;">
 <p style="margin:0;font-size:13px;color:#666;">{label}</p>
 <p style="margin:0;font-size:16px;font-weight:500;word-break:break-word;">{value}</p>
 </div>""",
-                        unsafe_allow_html=True,
-                    )
-        st.markdown("")
+                    unsafe_allow_html=True,
+                )
+    st.markdown("")
 
-    # Warnings
-    for w in final_event.get("warnings", []):
-        st.warning(w)
 
-    # Charts — pick the chart_step dataframe, plus the first other df for a pie
-    chart_step = final_event.get("chart_step")
-    chart_df = step_results.get(chart_step) if chart_step else None
+def _render_report(final_state: dict, step_dfs: dict) -> None:
+    st.markdown("---")
+    st.markdown("### Executive Summary")
 
-    # Fallback: use the largest DataFrame available
-    if chart_df is None or not isinstance(chart_df, pd.DataFrame) or chart_df.empty:
-        for df_candidate in step_results.values():
-            if isinstance(df_candidate, pd.DataFrame) and not df_candidate.empty:
-                chart_df = df_candidate
-                break
+    _render_metrics(final_state.get("metrics", []))
 
-    if chart_df is not None and isinstance(chart_df, pd.DataFrame) and not chart_df.empty:
-        num_cols_count = sum(1 for c in chart_df.columns if pd.api.types.is_numeric_dtype(chart_df[c]))
-        cat_cols_count = sum(1 for c in chart_df.columns if chart_df[c].dtype == object)
+    # Charts — use largest DataFrame available
+    chart_df = None
+    for result in step_dfs.values():
+        if isinstance(result, pd.DataFrame) and not result.empty:
+            if chart_df is None or len(result) > len(chart_df):
+                chart_df = result
 
-        if cat_cols_count >= 1 and num_cols_count >= 1:
+    if chart_df is not None:
+        cat_count = sum(1 for c in chart_df.columns if chart_df[c].dtype == object)
+        num_count = sum(1 for c in chart_df.columns if pd.api.types.is_numeric_dtype(chart_df[c]))
+        if cat_count >= 1 and num_count >= 1:
             c1, c2 = st.columns(2)
             with c1:
-                _auto_bar(chart_df, "Revenue / Value Breakdown")
+                _auto_bar(chart_df, "Value Breakdown")
             with c2:
                 _auto_pie(chart_df, "Distribution")
-
-        # Show as formatted table below charts
         with st.expander("View data table", expanded=False):
             st.dataframe(chart_df, use_container_width=True, hide_index=True)
 
-    # All other step dataframes as small expanders
-    for step_num, result in step_results.items():
+    # Other step dataframes
+    for step_num, result in step_dfs.items():
         if result is chart_df:
             continue
         if isinstance(result, pd.DataFrame) and not result.empty:
             with st.expander(f"Step {step_num} data", expanded=False):
                 st.dataframe(result, use_container_width=True, hide_index=True)
 
-    # Recommendations
-    recs = final_event.get("recommendations", [])
-    if recs:
-        st.markdown("**Recommendations**")
-        for rec in recs:
-            st.info(rec)
-
-
-# ── Agent runner ──────────────────────────────────────────────────────────────
-STEP_ICONS = {1: "📊", 2: "⚠️", 3: "🔍", 4: "💡", 5: "📈", 6: "🎯"}
-
-def run_agent(question: str, df: pd.DataFrame, api_key: str):
-    client = anthropic.Anthropic(api_key=api_key)
-    system_prompt = _build_agent_prompt(df)
-    messages = [{"role": "user", "content": question}]
-
-    parse_failures = 0
-
-    for _ in range(7):
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=system_prompt,
-            messages=messages,
-        )
-        raw = response.content[0].text.strip()
-
-        # ── Parse with up to 3 retries before falling back to plain chat ─────
-        step = None
-        try:
-            step = _parse_json(raw)
-        except (ValueError, json.JSONDecodeError):
-            parse_failures += 1
-            if parse_failures < 3:
-                # Ask Claude to fix its response without adding to conversation history
-                retry_resp = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=2048,
-                    system=system_prompt,
-                    messages=messages + [
-                        {"role": "assistant", "content": raw},
-                        {"role": "user", "content": "Your response was not valid JSON. Return ONLY one JSON object, nothing else."},
-                    ],
-                )
-                raw = retry_resp.content[0].text.strip()
-                try:
-                    step = _parse_json(raw)
-                except (ValueError, json.JSONDecodeError):
-                    pass  # will hit fallback below
-
-            if step is None:
-                # Fallback: plain-text answer, displayed as info
-                fallback_resp = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": question}],
-                )
-                yield {
-                    "type": "final",
-                    "number": 1,
-                    "description": "Analysis",
-                    "metrics": [],
-                    "chart_step": None,
-                    "warnings": [],
-                    "recommendations": [fallback_resp.content[0].text.strip()],
-                }
-                return
-
-        messages.append({"role": "assistant", "content": raw})
-
-        step_num = step.get("step_number", len(messages) // 2)
-
-        if step.get("is_final"):
-            yield {
-                "type": "final",
-                "number": step_num,
-                "description": step.get("step_description", "Executive Summary"),
-                "metrics": step.get("metrics", []),
-                "chart_step": step.get("chart_step"),
-                "warnings": step.get("warnings", []),
-                "recommendations": step.get("recommendations", []),
-            }
-            return
-
-        result = None
-        error_msg = None
-        code = step.get("pandas_code", "")
-        if code:
-            try:
-                local_vars = {"df": df.copy(), "pd": pd}
-                exec(code, {}, local_vars)
-                result = local_vars.get("result", None)
-            except Exception as e:
-                error_msg = str(e)
-
-        yield {
-            "type": "step",
-            "number": step_num,
-            "description": step.get("step_description", f"Step {step_num}"),
-            "result": result,
-            "error": error_msg,
-        }
-
-        if result is not None and isinstance(result, pd.DataFrame):
-            result_str = result.head(10).to_string(index=False)
-        elif result is not None:
-            result_str = str(result)
-        else:
-            result_str = f"Execution error: {error_msg}" if error_msg else "No result produced."
-
-        messages.append({
-            "role": "user",
-            "content": f"Step {step_num} result:\n{result_str}\n\nContinue to the next step.",
-        })
-
-
-# ── Replay helper ─────────────────────────────────────────────────────────────
-def _replay_entry(entry: dict) -> None:
-    step_results = {}
-    final_event = None
-    for s in entry["steps"]:
-        if s["type"] == "step":
-            icon = STEP_ICONS.get(s["number"], "🔹")
-            suffix = f" — {len(s['result'])} rows" if isinstance(s.get("result"), pd.DataFrame) else ""
-            with st.expander(f"{icon} Step {s['number']}: {s['description']}{suffix}", expanded=False):
-                if s.get("error"):
-                    st.warning(s["error"])
-                elif isinstance(s.get("result"), pd.DataFrame):
-                    st.dataframe(s["result"], use_container_width=True, hide_index=True)
-                elif s.get("result") is not None:
-                    st.metric("Result", s["result"])
-            if isinstance(s.get("result"), pd.DataFrame):
-                step_results[s["number"]] = s["result"]
-        elif s["type"] == "final":
-            final_event = s
-        elif s["type"] == "error":
-            st.error(s["message"])
-    if final_event:
-        _render_final(final_event, step_results)
+    for rec in final_state.get("recommendations", []):
+        st.info(rec)
 
 
 # ── Example questions ─────────────────────────────────────────────────────────
@@ -408,65 +360,89 @@ for entry in st.session_state["agent_history"]:
     with st.chat_message("user"):
         st.markdown(entry["question"])
     with st.chat_message("assistant"):
-        _replay_entry(entry)
+        for log in entry.get("steps_log", []):
+            with st.expander(log["label"], expanded=False):
+                if log.get("df") is not None:
+                    st.dataframe(log["df"], use_container_width=True, hide_index=True)
+                elif log.get("text"):
+                    st.markdown(log["text"])
+        _render_report(entry["final_state"], entry["step_dfs"])
 
 # ── Run agent ─────────────────────────────────────────────────────────────────
+NODE_LABELS = {
+    "planner":   "Planning analysis...",
+    "analyst":   "Querying data...",
+    "evaluator": "Evaluating results...",
+    "advisor":   "Generating recommendations...",
+}
+
 if question:
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        completed_steps = []
-        step_results = {}
+        steps_log = []
+        final_state = {}
 
-        with st.status("🤔 Understanding your question...", expanded=True) as status:
-            try:
-                for event in run_agent(question, df, api_key):
-                    completed_steps.append(event)
-                    icon = STEP_ICONS.get(event.get("number", 1), "🔹")
+        try:
+            graph, step_dfs = build_graph(api_key, df)
 
-                    if event["type"] == "step":
-                        result = event.get("result")
-                        suffix = f" — {len(result)} rows" if isinstance(result, pd.DataFrame) else ""
-                        status.update(label=f"{icon} Step {event['number']}: {event['description']}{suffix}")
+            initial_state: AgentState = {
+                "question": question,
+                "plan": "",
+                "data_results": [],
+                "sufficient": False,
+                "metrics": [],
+                "recommendations": [],
+                "loop_count": 0,
+                "error": None,
+            }
 
-                        with st.expander(
-                            f"{icon} Step {event['number']}: {event['description']}{suffix}",
-                            expanded=False,
-                        ):
-                            if event.get("error"):
-                                st.warning(event["error"])
-                            elif isinstance(result, pd.DataFrame):
-                                st.dataframe(result, use_container_width=True, hide_index=True)
-                            elif result is not None:
-                                st.metric("Result", result)
+            with st.status("🤔 Starting analysis...", expanded=True) as status:
+                for event in graph.stream(initial_state, stream_mode="updates"):
+                    for node_name, node_output in event.items():
+                        label = NODE_LABELS.get(node_name, f"Running {node_name}...")
+                        status.update(label=f"⚙️ {label}")
 
-                        if isinstance(result, pd.DataFrame):
-                            step_results[event["number"]] = result
+                        if node_name == "planner" and node_output.get("plan"):
+                            with st.expander("📋 Plan", expanded=False):
+                                st.markdown(node_output["plan"])
+                            steps_log.append({"label": "📋 Plan", "text": node_output["plan"]})
 
-                    elif event["type"] == "final":
-                        status.update(label="✅ Analysis complete", state="complete")
+                        elif node_name == "analyst":
+                            results = node_output.get("data_results", [])
+                            if results:
+                                latest = results[-1]
+                                step_num = latest["step"]
+                                step_df = step_dfs.get(step_num)
+                                exp_label = f"📊 Step {step_num}: {latest['description']}"
+                                with st.expander(exp_label, expanded=False):
+                                    if isinstance(step_df, pd.DataFrame):
+                                        st.dataframe(step_df, use_container_width=True, hide_index=True)
+                                    elif step_df is not None:
+                                        st.metric("Result", str(step_df))
+                                    else:
+                                        st.markdown(latest["result_str"])
+                                steps_log.append({
+                                    "label": exp_label,
+                                    "df": step_df if isinstance(step_df, pd.DataFrame) else None,
+                                    "text": latest["result_str"] if not isinstance(step_df, pd.DataFrame) else None,
+                                })
 
-                    elif event["type"] == "error":
-                        status.update(label="Error during analysis", state="error")
-                        st.error(event["message"])
+                        elif node_name == "advisor":
+                            final_state = node_output
+                            status.update(label="✅ Analysis complete", state="complete")
 
-            except anthropic.AuthenticationError:
-                status.update(label="Authentication failed", state="error")
-                st.error("Invalid API key.")
-            except Exception as e:
-                status.update(label="Unexpected error", state="error")
-                st.error(f"Error: {e}")
+        except Exception as e:
+            st.error(f"Agent error: {e}")
 
-        # Render final visual report outside the status box
-        for event in completed_steps:
-            if event["type"] == "final":
-                _render_final(event, step_results)
-
-        if completed_steps:
+        if final_state:
+            _render_report(final_state, step_dfs)
             st.session_state["agent_history"].append({
                 "question": question,
-                "steps": completed_steps,
+                "steps_log": steps_log,
+                "final_state": final_state,
+                "step_dfs": step_dfs,
             })
 
 if st.session_state["agent_history"]:

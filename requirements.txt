@@ -4,3 +4,6 @@ plotly
 scikit-learn
 anthropic
 openpyxl
+langchain
+langchain-anthropic
+langgraph
