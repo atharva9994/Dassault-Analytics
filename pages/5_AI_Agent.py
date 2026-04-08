@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import re
 import json
 import sys, os
@@ -46,7 +45,6 @@ class AgentState(TypedDict):
     metrics: List[dict]
     findings: List[str]
     recommendations: List[str]
-    charts: List[dict]          # [{type, step, title}]
     loop_count: int
     error: Optional[str]
 
@@ -120,158 +118,27 @@ def _fmt_display_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ── Safe chart helpers ────────────────────────────────────────────────────────
-def _best_cat_num(df: pd.DataFrame):
-    """Pick the best categorical and numeric columns, excluding Deal_ID."""
-    skip = {"deal_id", "id", "index"}
-    cat_cols = [c for c in df.columns
-                if df[c].dtype == object and c.lower() not in skip]
-    num_cols = [c for c in df.columns
-                if pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in skip]
-    return cat_cols, num_cols
+# ── Table renderer ────────────────────────────────────────────────────────────
+def _best_display_df(step_dfs: dict) -> pd.DataFrame | None:
+    """Return the largest non-empty DataFrame from step results."""
+    best = None
+    for r in step_dfs.values():
+        if isinstance(r, pd.DataFrame) and not r.empty:
+            if best is None or len(r) > len(best):
+                best = r
+    return best
 
 
-def _safe_bar(raw_df: pd.DataFrame, title: str) -> None:
-    """Horizontal bar: top 10 by numeric value."""
-    try:
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        if not cat_cols or not num_cols:
-            return
-        df = raw_df[[cat_cols[0], num_cols[0]]].dropna().nlargest(10, num_cols[0])
-        df = _rename_cols(df)
-        c, n = df.columns[0], df.columns[1]
-        fig = px.bar(df, x=n, y=c, orientation="h", title=title,
-                     color=n, color_continuous_scale="Blues", text=n)
-        fig.update_layout(coloraxis_showscale=False,
-                          yaxis={"categoryorder": "total ascending"},
-                          xaxis_showgrid=False, yaxis_showgrid=False,
-                          margin={"t": 45, "b": 10, "l": 10, "r": 10},
-                          height=max(280, len(df) * 38 + 80), plot_bgcolor="white")
-        fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside",
-                          marker_line_width=0)
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-def _safe_pie(raw_df: pd.DataFrame, title: str) -> None:
-    """Pie: top 5 + Others."""
-    try:
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        if not cat_cols or not num_cols:
-            return
-        df = raw_df[[cat_cols[0], num_cols[0]]].dropna().copy()
-        df.columns = ["Category", "Value"]
-        df = df.groupby("Category", as_index=False)["Value"].sum().sort_values("Value", ascending=False)
-        if len(df) > 6:
-            others = pd.DataFrame([{"Category": "Others", "Value": df.iloc[5:]["Value"].sum()}])
-            df = pd.concat([df.head(5), others], ignore_index=True)
-        fig = px.pie(df, names="Category", values="Value", title=title,
-                     color_discrete_sequence=px.colors.sequential.Blues_r)
-        fig.update_layout(margin={"t": 45, "b": 10, "l": 10, "r": 10})
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-def _safe_donut(raw_df: pd.DataFrame, title: str) -> None:
-    """Donut: same as pie but with hole."""
-    try:
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        if not cat_cols or not num_cols:
-            return
-        df = raw_df[[cat_cols[0], num_cols[0]]].dropna().copy()
-        df.columns = ["Category", "Value"]
-        df = df.groupby("Category", as_index=False)["Value"].sum().sort_values("Value", ascending=False)
-        if len(df) > 6:
-            others = pd.DataFrame([{"Category": "Others", "Value": df.iloc[5:]["Value"].sum()}])
-            df = pd.concat([df.head(5), others], ignore_index=True)
-        fig = px.pie(df, names="Category", values="Value", title=title,
-                     hole=0.4, color_discrete_sequence=px.colors.sequential.Blues_r)
-        fig.update_layout(margin={"t": 45, "b": 10, "l": 10, "r": 10})
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-def _safe_line(raw_df: pd.DataFrame, title: str) -> None:
-    """Line chart: first date/string col as x, numeric cols as y."""
-    try:
-        # Prefer a date column, fallback to first categorical
-        date_cols = [c for c in raw_df.columns
-                     if pd.api.types.is_datetime64_any_dtype(raw_df[c])
-                     or any(k in c.lower() for k in ["date", "month", "quarter", "year", "period"])]
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        x_col = (date_cols or cat_cols or [None])[0]
-        if x_col is None or not num_cols:
-            return
-        df = _rename_cols(raw_df[[x_col] + num_cols[:3]].dropna().copy())
-        x_r = df.columns[0]
-        y_cols = list(df.columns[1:])
-        fig = px.line(df, x=x_r, y=y_cols, title=title, markers=True)
-        fig.update_layout(xaxis_showgrid=False, yaxis_showgrid=True,
-                          margin={"t": 45, "b": 10, "l": 10, "r": 10},
-                          plot_bgcolor="white", legend_title="")
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-def _safe_scatter(raw_df: pd.DataFrame, title: str) -> None:
-    """Scatter: first two numeric cols, optional colour from categorical."""
-    try:
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        if len(num_cols) < 2:
-            return
-        df = _rename_cols(raw_df.copy())
-        num_r = [_COL_LABELS.get(c, c) for c in num_cols[:2]]
-        color_col = (_COL_LABELS.get(cat_cols[0], cat_cols[0]) if cat_cols else None)
-        fig = px.scatter(df, x=num_r[0], y=num_r[1], color=color_col,
-                         title=title, size_max=12,
-                         color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(xaxis_showgrid=False, yaxis_showgrid=False,
-                          margin={"t": 45, "b": 10, "l": 10, "r": 10},
-                          plot_bgcolor="white")
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-def _safe_stacked_bar(raw_df: pd.DataFrame, title: str) -> None:
-    """Stacked bar: first cat col as x, remaining cat col as colour, numeric as value."""
-    try:
-        cat_cols, num_cols = _best_cat_num(raw_df)
-        if len(cat_cols) < 2 or not num_cols:
-            # Fallback to regular bar if not enough dimensions
-            _safe_bar(raw_df, title)
-            return
-        df = _rename_cols(raw_df[[cat_cols[0], cat_cols[1], num_cols[0]]].dropna().copy())
-        c0, c1, n = df.columns[0], df.columns[1], df.columns[2]
-        fig = px.bar(df, x=c0, y=n, color=c1, title=title, barmode="stack",
-                     color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(xaxis_showgrid=False, yaxis_showgrid=False,
-                          margin={"t": 45, "b": 10, "l": 10, "r": 10},
-                          plot_bgcolor="white", legend_title=c1)
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        pass
-
-
-_CHART_RENDERERS = {
-    "bar":          _safe_bar,
-    "pie":          _safe_pie,
-    "donut":        _safe_donut,
-    "line":         _safe_line,
-    "scatter":      _safe_scatter,
-    "stacked_bar":  _safe_stacked_bar,
-    "stacked":      _safe_stacked_bar,
-}
-
-def _dispatch_chart(chart_type: str, df: pd.DataFrame, title: str) -> None:
-    renderer = _CHART_RENDERERS.get(chart_type.lower(), _safe_bar)
-    renderer(df, title)
+def _column_config(df: pd.DataFrame) -> dict:
+    """Build st.column_config entries for numeric/revenue columns."""
+    cfg = {}
+    for col in df.columns:
+        low = col.lower()
+        if any(k in low for k in ["revenue", "value", "amount", "($)"]):
+            cfg[col] = st.column_config.NumberColumn(col, format="$%,.0f")
+        elif any(k in low for k in ["seats", "count", "usage", "hrs"]):
+            cfg[col] = st.column_config.NumberColumn(col, format="%,.0f")
+    return cfg
 
 
 # ── Metrics renderer ──────────────────────────────────────────────────────────
@@ -302,7 +169,6 @@ def _render_report(final_state: dict, step_dfs: dict) -> None:
     findings = final_state.get("findings", [])
     recommendations = final_state.get("recommendations", [])
 
-    # Guard: nothing to show
     if not metrics and not findings and not recommendations and not step_dfs:
         st.info("No data found for this query. Try a different question.")
         return
@@ -320,41 +186,17 @@ def _render_report(final_state: dict, step_dfs: dict) -> None:
             st.markdown(f"- {f}")
         st.markdown("")
 
-    # ── 3. Charts ─────────────────────────────────────────────────────────────
-    chart_configs = final_state.get("charts", [])[:2]
-
-    # Fallback: if advisor returned no chart config, pick largest df + use bar+pie
-    if not chart_configs:
-        fallback_df = None
-        for result in step_dfs.values():
-            if isinstance(result, pd.DataFrame) and not result.empty:
-                cat_c, num_c = _best_cat_num(result)
-                if cat_c and num_c:
-                    if fallback_df is None or len(result) > len(fallback_df):
-                        fallback_df = result
-        if fallback_df is not None:
-            chart_configs = [
-                {"type": "bar", "step": None, "title": "Top 10 by Value", "_df": fallback_df},
-                {"type": "pie", "step": None, "title": "Distribution",    "_df": fallback_df},
-            ]
-
-    if chart_configs:
-        st.subheader("Charts")
-        cols = st.columns(len(chart_configs))
-        for col, cfg in zip(cols, chart_configs):
-            df_for_chart = cfg.get("_df")  # pre-resolved fallback
-            if df_for_chart is None:
-                step_key = cfg.get("step")
-                df_for_chart = step_dfs.get(step_key) if step_key else None
-                # still none — pick any available df
-                if df_for_chart is None:
-                    for r in step_dfs.values():
-                        if isinstance(r, pd.DataFrame) and not r.empty:
-                            df_for_chart = r
-                            break
-            if df_for_chart is not None:
-                with col:
-                    _dispatch_chart(cfg.get("type", "bar"), df_for_chart, cfg.get("title", ""))
+    # ── 3. Data Table ─────────────────────────────────────────────────────────
+    primary_df = _best_display_df(step_dfs)
+    if primary_df is not None:
+        st.subheader("Data")
+        display = _fmt_display_df(primary_df.head(15))
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_column_config(display),
+        )
 
     # ── 4. Recommendations ────────────────────────────────────────────────────
     if recommendations:
@@ -362,14 +204,16 @@ def _render_report(final_state: dict, step_dfs: dict) -> None:
         for rec in recommendations:
             st.info(rec)
 
-    # ── 5. Detailed Data (collapsed) ──────────────────────────────────────────
+    # ── 5. Full data (collapsed) ──────────────────────────────────────────────
     all_dfs = [r for r in step_dfs.values() if isinstance(r, pd.DataFrame) and not r.empty]
-    if all_dfs:
-        with st.expander("View detailed data", expanded=False):
+    if len(all_dfs) > 1 or (all_dfs and len(all_dfs[0]) > 15):
+        with st.expander("View full data", expanded=False):
             for i, d in enumerate(all_dfs):
                 if len(all_dfs) > 1:
                     st.caption(f"Dataset {i + 1}")
-                st.dataframe(_fmt_display_df(d), use_container_width=True, hide_index=True)
+                full = _fmt_display_df(d)
+                st.dataframe(full, use_container_width=True, hide_index=True,
+                             column_config=_column_config(full))
 
 
 # ── Graph builder ─────────────────────────────────────────────────────────────
@@ -536,26 +380,10 @@ Return ONLY a JSON object with this exact structure:
   "recommendations": [
     "Prioritize renewal outreach for the 12 high-risk CATIA accounts in EMEA — $2.4M at stake",
     "Investigate low usage in North America subscription accounts before next renewal cycle"
-  ],
-  "charts": [
-    {{"type": "bar", "step": 1, "title": "Revenue by Product"}},
-    {{"type": "pie", "step": 1, "title": "Revenue Share by Product"}}
   ]
 }}
 
-Chart selection rules — choose the 2 most insightful chart types for the specific question:
-- Comparing categories (products, regions, industries, rankings): use "bar"
-- Showing composition/share/mix (license type split, segment distribution): use "pie" or "donut"
-- Showing trends over time (monthly, quarterly, yearly): use "line"
-- Showing correlation (revenue vs usage, seats vs value): use "scatter"
-- Showing risk levels by multiple dimensions: use "stacked_bar"
-- If question is about trends → line chart, NOT pie
-- If question is about risk → stacked_bar or bar, NOT pie
-- If question is about share/composition → pie or donut, NOT bar
-- Max 2 charts total
-- "step" must be the step number from data_results whose DataFrame best fits the chart
-
-Other rules:
+Rules:
 - metrics: 2–4 key numbers from the data (format as $X.XM or plain number)
 - findings: 3–4 specific data-backed statements with real numbers and percentages
 - recommendations: 3–4 short action-oriented bullets (Prioritize/Investigate/Schedule/Consider)
@@ -570,14 +398,13 @@ Other rules:
                 "metrics": data.get("metrics", []),
                 "findings": data.get("findings", []),
                 "recommendations": data.get("recommendations", []),
-                "charts": data.get("charts", []),
             }
             if any(result.values()):
                 return result
         except Exception:
             pass
         lines = [l.strip("- •*").strip() for l in raw.splitlines() if len(l.strip()) > 20]
-        return {"metrics": [], "findings": [], "recommendations": lines[:5], "charts": []}
+        return {"metrics": [], "findings": [], "recommendations": lines[:5]}
 
     # ── Routing ───────────────────────────────────────────────────────────────
     def route_evaluator(state: AgentState) -> str:
@@ -662,7 +489,6 @@ if question:
                 "metrics": [],
                 "findings": [],
                 "recommendations": [],
-                "charts": [],
                 "loop_count": 0,
                 "error": None,
             }
