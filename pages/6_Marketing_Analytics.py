@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+from chat_sidebar import render_chat_sidebar
 
 st.set_page_config(page_title="Marketing Analytics", layout="wide")
 st.title("Marketing Analytics")
@@ -199,3 +200,5 @@ email_df = (
 )
 st.dataframe(email_df, use_container_width=True, hide_index=True)
 st.caption("Email open and click rates by campaign type. Higher click rates indicate more engaged audiences.")
+
+render_chat_sidebar()

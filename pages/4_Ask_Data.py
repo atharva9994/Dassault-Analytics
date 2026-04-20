@@ -74,6 +74,19 @@ if not api_key:
         st.info("Enter your API key above to enable chat.")
         st.stop()
 
+# ── Sample question buttons ───────────────────────────────────────────────────
+_SAMPLE_QUESTIONS = [
+    "What are the top 5 customers by revenue?",
+    "Compare CATIA vs SOLIDWORKS sales by region",
+    "Show marketing campaign ROI by channel",
+    "Which marketing channel generates the most leads?",
+]
+scols = st.columns(len(_SAMPLE_QUESTIONS))
+for col, sq in zip(scols, _SAMPLE_QUESTIONS):
+    if col.button(sq, use_container_width=True):
+        st.session_state["_sample_q"] = sq
+        st.rerun()
+
 # ── Chat history ──────────────────────────────────────────────────────────────
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
@@ -91,6 +104,8 @@ for msg in st.session_state["chat_history"]:
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 user_input = st.chat_input("Ask a question about your data...")
+if not user_input and st.session_state.get("_sample_q"):
+    user_input = st.session_state.pop("_sample_q")
 
 if user_input:
     st.session_state["chat_history"].append({"role": "user", "content": user_input})
