@@ -433,6 +433,8 @@ EXAMPLES = [
     "Compare subscription vs perpetual revenue trends and recommend a strategy",
     "Find underperforming regions and suggest growth opportunities",
     "Identify our top 10 customers and analyze their license patterns",
+    "Which marketing channel has the best ROI and where should we increase budget?",
+    "Analyze our lead generation funnel and recommend improvements",
 ]
 
 st.markdown("**Example questions:**")
