@@ -48,45 +48,107 @@ X_scaled = scaler.fit_transform(X)
 N_CLUSTERS = 4
 with st.spinner("Running segmentation model…"):
     kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
-    customer_df["Segment"] = kmeans.fit_predict(X_scaled).astype(str)
+    customer_df["_cluster"] = kmeans.fit_predict(X_scaled).astype(str)
 
-# ── Cluster summary ────────────────────────────────────────────────────────────
-summary_agg = {f: "mean" for f in cluster_features}
-summary_agg["Customer_Name"] = "count"
+# ── Compute per-cluster averages to assign business names ─────────────────────
+_summary_agg = {f: "mean" for f in cluster_features}
+_summary_agg["Customer_Name"] = "count"
+_cs = (
+    customer_df.groupby("_cluster")
+    .agg(_summary_agg)
+    .rename(columns={"Customer_Name": "Customer_Count"})
+    .reset_index()
+)
+for col in cluster_features:
+    _cs[col] = _cs[col].round(1)
+
+usage_col = "Avg_Usage_Hours" if "Avg_Usage_Hours" in _cs.columns else "Deal_Count"
+
+# Sequential assignment: most-constrained first
+remaining = list(_cs["_cluster"])
+name_map: dict = {}
+
+# Small Accounts: lowest Total_Revenue
+small_seg = _cs.loc[_cs["Total_Revenue"].idxmin(), "_cluster"]
+name_map[small_seg] = "Small Accounts"
+remaining.remove(small_seg)
+
+# Champions: highest combined revenue + usage rank among the rest
+_rem = _cs[_cs["_cluster"].isin(remaining)].copy()
+_rem["_rev_rank"]   = _rem["Total_Revenue"].rank()
+_rem["_usage_rank"] = _rem[usage_col].rank()
+_rem["_score"]      = _rem["_rev_rank"] + _rem["_usage_rank"]
+champ_seg = _rem.loc[_rem["_score"].idxmax(), "_cluster"]
+name_map[champ_seg] = "Champions"
+remaining.remove(champ_seg)
+
+# At Risk: lowest usage among the two high-revenue survivors
+_rem2 = _cs[_cs["_cluster"].isin(remaining)].copy()
+at_risk_seg = _rem2.loc[_rem2[usage_col].idxmin(), "_cluster"]
+name_map[at_risk_seg] = "At Risk"
+remaining.remove(at_risk_seg)
+
+# Growth Accounts: the last remaining cluster
+name_map[remaining[0]] = "Growth Accounts"
+
+customer_df["Segment"] = customer_df["_cluster"].map(name_map)
+
+# ── Segment metadata ──────────────────────────────────────────────────────────
+SEGMENT_ORDER = ["Champions", "Growth Accounts", "At Risk", "Small Accounts"]
+
+SEGMENT_COLORS = {
+    "Champions":       "#2ecc71",
+    "Growth Accounts": "#3498db",
+    "At Risk":         "#e74c3c",
+    "Small Accounts":  "#95a5a6",
+}
+SEGMENT_DESCRIPTIONS = {
+    "Champions":       "High value, high engagement — protect and reward",
+    "Growth Accounts": "Growing usage — invest and upsell",
+    "At Risk":         "High spend but low usage — intervene now",
+    "Small Accounts":  "Low engagement — maintain with minimal effort",
+}
+SEGMENT_ACTIONS = {
+    "Champions":       "Offer loyalty programs, executive briefings, and early access to new features.",
+    "Growth Accounts": "Assign dedicated CSMs, schedule QBRs, and present upsell opportunities.",
+    "At Risk":         "Trigger immediate outreach, run health checks, and offer re-onboarding.",
+    "Small Accounts":  "Automate touchpoints, provide self-serve resources, monitor for churn signals.",
+}
+
+# ── Rebuild cluster summary with business names ───────────────────────────────
 cluster_summary = (
     customer_df.groupby("Segment")
-    .agg(summary_agg)
+    .agg({**{f: "mean" for f in cluster_features}, "Customer_Name": "count"})
     .rename(columns={"Customer_Name": "Customer_Count"})
     .reset_index()
 )
 for col in cluster_features:
     cluster_summary[col] = cluster_summary[col].round(1)
 
-# Identify key segments
-top_rev_seg    = cluster_summary.loc[cluster_summary["Total_Revenue"].idxmax()]
-top_deals_seg  = cluster_summary.loc[cluster_summary["Deal_Count"].idxmax()]
-low_rev_seg    = cluster_summary.loc[cluster_summary["Total_Revenue"].idxmin()]
+total_rev_by_seg = customer_df.groupby("Segment")["Total_Revenue"].sum()
 
-# ── Insights section ──────────────────────────────────────────────────────────
-st.subheader("Customer Segmentation Insights")
+# ── KPI cards ─────────────────────────────────────────────────────────────────
+st.subheader("Segment Overview")
 
-m1, m2, m3 = st.columns(3)
+seg_cols = st.columns(4)
+for i, seg_name in enumerate(SEGMENT_ORDER):
+    row = cluster_summary[cluster_summary["Segment"] == seg_name]
+    if row.empty:
+        continue
+    row = row.iloc[0]
+    total_rev = total_rev_by_seg.get(seg_name, 0)
+    count = int(row["Customer_Count"])
+    color = SEGMENT_COLORS[seg_name]
+    desc  = SEGMENT_DESCRIPTIONS[seg_name]
 
-m1.metric(
-    label=f"Highest Revenue — Segment {top_rev_seg['Segment']}",
-    value=f"${top_rev_seg['Total_Revenue']:,.0f}",
-    help=f"{int(top_rev_seg['Customer_Count'])} customers · avg revenue per customer",
-)
-m2.metric(
-    label=f"Most Active — Segment {top_deals_seg['Segment']}",
-    value=f"{int(top_deals_seg['Deal_Count'])} deals avg",
-    help=f"{int(top_deals_seg['Customer_Count'])} customers in this segment",
-)
-m3.metric(
-    label=f"Lowest Revenue — Segment {low_rev_seg['Segment']}",
-    value=f"${low_rev_seg['Total_Revenue']:,.0f}",
-    help=f"{int(low_rev_seg['Customer_Count'])} customers — potential upsell targets",
-)
+    with seg_cols[i]:
+        st.markdown(f"""
+<div style="border-left:4px solid {color};padding:10px 14px;background:#fafafa;border-radius:6px;">
+  <div style="font-size:1.05rem;font-weight:700;color:{color};">{seg_name}</div>
+  <div style="font-size:0.76rem;color:#555;margin-bottom:8px;">{desc}</div>
+  <div style="font-size:1.45rem;font-weight:700;">${total_rev:,.0f}</div>
+  <div style="font-size:0.82rem;color:#888;">{count} customers</div>
+</div>""", unsafe_allow_html=True)
 
 st.divider()
 
@@ -95,17 +157,26 @@ st.subheader("Revenue vs Usage by Segment")
 
 x_col    = "Total_Revenue"
 y_col    = "Avg_Usage_Hours" if "Avg_Usage_Hours" in customer_df.columns else "Deal_Count"
-size_col = "Total_Seats" if "Total_Seats" in customer_df.columns else None
+size_col = "Total_Seats"     if "Total_Seats"     in customer_df.columns else None
+
+selected_segments = st.multiselect(
+    "Filter by segment",
+    options=SEGMENT_ORDER,
+    default=SEGMENT_ORDER,
+    key="seg_filter",
+)
+plot_df = customer_df[customer_df["Segment"].isin(selected_segments)]
 
 fig = px.scatter(
-    customer_df,
+    plot_df,
     x=x_col,
     y=y_col,
     color="Segment",
     size=size_col,
     hover_name="Customer_Name",
     labels={x_col: "Total Revenue (USD)", y_col: y_col.replace("_", " ")},
-    color_discrete_sequence=px.colors.qualitative.Set2,
+    color_discrete_map=SEGMENT_COLORS,
+    category_orders={"Segment": SEGMENT_ORDER},
 )
 fig.update_layout(
     plot_bgcolor="white",
@@ -122,12 +193,17 @@ st.divider()
 st.subheader("Segment Summary")
 
 display_summary = cluster_summary.copy()
+_order_map = {s: i for i, s in enumerate(SEGMENT_ORDER)}
+display_summary["_order"] = display_summary["Segment"].map(_order_map)
+display_summary = display_summary.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
 display_summary["Total_Revenue"] = display_summary["Total_Revenue"].apply(lambda x: f"${x:,.0f}")
 if "Total_Seats" in display_summary.columns:
     display_summary["Total_Seats"] = display_summary["Total_Seats"].apply(lambda x: f"{x:,.0f}")
 if "Avg_Usage_Hours" in display_summary.columns:
     display_summary["Avg_Usage_Hours"] = display_summary["Avg_Usage_Hours"].apply(lambda x: f"{x:.1f} hrs")
 display_summary["Deal_Count"] = display_summary["Deal_Count"].apply(lambda x: f"{x:.1f}")
+display_summary = display_summary.rename(columns={"Customer_Count": "Customers"})
 
 st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
@@ -145,6 +221,34 @@ if "Avg_Usage_Hours" in display_df.columns:
     display_df["Avg_Usage_Hours"] = display_df["Avg_Usage_Hours"].apply(lambda x: f"{x:.1f}")
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ── What this means ───────────────────────────────────────────────────────────
+st.subheader("What This Means")
+
+for seg_name in SEGMENT_ORDER:
+    row = cluster_summary[cluster_summary["Segment"] == seg_name]
+    if row.empty:
+        continue
+    row       = row.iloc[0]
+    total_rev = total_rev_by_seg.get(seg_name, 0)
+    count     = int(row["Customer_Count"])
+    color     = SEGMENT_COLORS[seg_name]
+    desc      = SEGMENT_DESCRIPTIONS[seg_name]
+    action    = SEGMENT_ACTIONS[seg_name]
+
+    st.markdown(f"""
+<div style="border-left:4px solid {color};padding:12px 16px;margin-bottom:12px;background:#fafafa;border-radius:6px;">
+  <div style="font-size:1.05rem;font-weight:700;color:{color};">
+    {seg_name}&nbsp;<span style="font-weight:400;font-size:0.85rem;color:#555;">— {desc}</span>
+  </div>
+  <div style="margin-top:6px;display:flex;gap:32px;">
+    <span><strong>{count}</strong> customers</span>
+    <span><strong>${total_rev:,.0f}</strong> total revenue</span>
+  </div>
+  <div style="margin-top:6px;font-size:0.88rem;color:#444;"><strong>Recommended action:</strong> {action}</div>
+</div>""", unsafe_allow_html=True)
 
 # ── Sidebar chat ──────────────────────────────────────────────────────────────
 import sys, os
