@@ -141,6 +141,8 @@ for col in cluster_features:
 total_rev_by_seg = customer_df.groupby("Segment")["Total_Revenue"].sum()
 
 # ── KPI cards ─────────────────────────────────────────────────────────────────
+st.caption("K-means clustering groups customers by similarity across deal value, usage hours, and seats — no predefined labels, the algorithm discovered these segments naturally.")
+
 st.subheader("Segment Overview")
 
 seg_cols = st.columns(4)
