@@ -8,18 +8,6 @@ st.set_page_config(page_title="Customer Segments", page_icon="🗂️", layout="
 st.title("Customer Segmentation")
 st.caption("Customers grouped by revenue, deal activity, and usage patterns using KMeans clustering.")
 
-with st.expander("How does customer segmentation work?"):
-    st.markdown("""
-- **We used K-means clustering** — an unsupervised machine learning algorithm that groups similar customers together without any predefined labels.
-- **It looks at three things** for each customer: deal value, usage hours, and seats.
-- **The algorithm drops 4 center points**, assigns every customer to the nearest point, moves each point to the center of its group, and repeats until groups stabilize.
-- **The result is 4 natural customer segments** — the algorithm found these groups on its own based purely on similarity.
-- **We then analyzed each group's numbers** and gave them business names.
-""")
-
-st.caption("Unlike churn prediction which uses labeled data, segmentation discovers hidden patterns — we didn't tell it what the groups should be. The data decided.")
-
-st.divider()
 
 if "data" not in st.session_state:
     st.warning("No data loaded. Please upload a file on the Home page.")
