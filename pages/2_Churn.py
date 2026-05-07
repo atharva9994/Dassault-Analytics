@@ -25,7 +25,7 @@ if "Churn_Risk" not in df.columns:
     st.stop()
 
 # ── How This Works ────────────────────────────────────────────────────────────
-with st.expander("How does churn prediction work?"):
+with st.expander("About this model"):
     st.markdown("""
 - **We trained a Random Forest model** — 100 decision trees each trained on different customer data.
 - **Each tree votes** on whether a customer will churn. Majority vote wins.
